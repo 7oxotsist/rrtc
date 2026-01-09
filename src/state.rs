@@ -1,12 +1,13 @@
+// state.rs (без изменений)
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc::UnboundedSender};
 use async_channel::Sender;
 use crate::sfu::SignalMessage;
 
 #[derive(Clone)]
 pub struct RoomManager {
-    rooms: Arc<Mutex<HashMap<String, Vec<String>>>>, // room_id → vec<sids>
+    rooms: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl RoomManager {
@@ -35,15 +36,15 @@ impl RoomManager {
 }
 
 #[derive(Clone)]
-pub struct SessionManager {
-    sessions: Arc<Mutex<HashMap<String, SessionInfo>>>, // sid → info
-}
-
-#[derive(Clone)]
 pub struct SessionInfo {
     pub room_id: String,
     pub media_port: u16,
-    pub client_tx: tokio::sync::mpsc::UnboundedSender<SignalMessage>,
+    pub response_tx: Option<UnboundedSender<SignalMessage>>,
+}
+
+#[derive(Clone)]
+pub struct SessionManager {
+    sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
 }
 
 impl SessionManager {
@@ -53,16 +54,25 @@ impl SessionManager {
         }
     }
 
-    pub async fn create_session(&self, sid: String, room_id: String, media_port: u16) -> tokio::sync::mpsc::UnboundedSender<SignalMessage> {
-        let (tx, _) = tokio::sync::mpsc::unbounded_channel::<SignalMessage>();
+    pub async fn create_session(&self, sid: String, room_id: String, media_port: u16) -> Result<(), ()> {
         let info = SessionInfo {
             room_id,
             media_port,
-            client_tx: tx.clone(),
+            response_tx: None,
         };
         let mut sessions = self.sessions.lock().await;
         sessions.insert(sid, info);
-        tx
+        Ok(())
+    }
+
+    pub async fn set_response_tx(&self, sid: &str, tx: UnboundedSender<SignalMessage>) -> Result<(), ()> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(sid) {
+            session.response_tx = Some(tx);
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 
     pub async fn get_session(&self, sid: &str) -> Option<SessionInfo> {
@@ -98,7 +108,6 @@ impl MediaPortManager {
         map.get(&port).cloned()
     }
 
-    // Простой выбор порта (можно улучшить: round-robin, по нагрузке)
     pub async fn allocate_port(&self) -> Option<u16> {
         let map = self.media_tx_map.lock().await;
         map.keys().next().copied()

@@ -1,5 +1,9 @@
+// grpc_service.rs (без изменений)
 use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
 use crate::sfu::{
     sfu_control_server::SfuControl,
     CreateRoomRequest, CreateRoomResponse,
@@ -17,7 +21,7 @@ pub struct SfuGrpcService {
 
 #[tonic::async_trait]
 impl SfuControl for SfuGrpcService {
-    type SignalStream = tokio_stream::wrappers::ReceiverStream<Result<SignalMessage, Status>>;
+    type SignalStream = ReceiverStream<Result<SignalMessage, Status>>;
 
     async fn create_room(&self, request: Request<CreateRoomRequest>) -> Result<Response<CreateRoomResponse>, Status> {
         let room_id = request.into_inner().room_id;
@@ -41,19 +45,15 @@ impl SfuControl for SfuGrpcService {
             }));
         }
 
-        let mut sid = req.sid;
-        /* if sid.is_empty() {
-            random_bytes = rng();
-            sid = uuid::Builder::from_random_bytes(random_bytes).into_uuid().hyphenated().to_string();
-        } */
-        
+        let sid = req.sid;
 
         let media_port = self.media_port_manager.allocate_port().await
             .ok_or(Status::internal("No available media ports"))?;
 
-        let _client_tx = self.session_manager.create_session(sid.clone(), room_id.clone(), media_port).await;
+        self.session_manager.create_session(sid.clone(), room_id.clone(), media_port).await
+            .map_err(|_| Status::internal("Failed to create session"))?;
 
-        self.room_manager.add_participant(String::from(room_id), sid.clone()).await;
+        self.room_manager.add_participant(room_id, sid.clone()).await;
 
         Ok(Response::new(JoinRoomResponse {
             success: true,
@@ -65,19 +65,28 @@ impl SfuControl for SfuGrpcService {
 
     async fn signal(&self, request: Request<Streaming<SignalMessage>>) -> Result<Response<Self::SignalStream>, Status> {
         let mut stream = request.into_inner();
-        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        let (server_tx, server_rx) = mpsc::channel(100);
 
         let session_manager = self.session_manager.clone();
         let media_port_manager = self.media_port_manager.clone();
 
         tokio::spawn(async move {
-            while let Some(msg) = tokio_stream::StreamExt::next(&mut stream).await {
-                let msg = match msg {
+            let mut current_sid: Option<String> = None;
+
+            while let Some(result) = stream.next().await {
+                let msg = match result {
                     Ok(m) => m,
                     Err(_) => break,
                 };
 
                 let sid = msg.sid.clone();
+
+                if current_sid.is_none() {
+                    current_sid = Some(sid.clone());
+                    let _ = session_manager.set_response_tx(&sid, server_tx..clone()).await;
+                }
+
                 if let Some(session) = session_manager.get_session(&sid).await {
                     if let Some(media_tx) = media_port_manager.get_tx(session.media_port).await {
                         let _ = media_tx.send(msg).await;
@@ -86,6 +95,6 @@ impl SfuControl for SfuGrpcService {
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(ReceiverStream::new(server_rx)))
     }
 }

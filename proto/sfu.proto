@@ -1,63 +1,42 @@
 syntax = "proto3";
 
-package sfu;
+package signaling;
 
-// Основной сервис управления комнатами и сессиями
-service SfuControl {
-  // Создать комнату (если уже существует — возвращаем OK)
-  rpc CreateRoom(CreateRoomRequest) returns (CreateRoomResponse);
-
-  // Присоединиться к комнате (клиент становится участником)
-  rpc JoinRoom(JoinRoomRequest) returns (JoinRoomResponse);
-
-  // Bidirectional stream для signaling (SDP offer/answer, ICE candidates)
-  rpc Signal(stream SignalMessage) returns (stream SignalMessage);
+message JoinRequest {
+  string conference_id = 1;
+  string user_id = 2;
+  string nickname = 3;
 }
 
-// ------------------- Комнаты -------------------
-message CreateRoomRequest {
-  string room_id = 1;
+message SDP {
+  string session_id = 1;
+  string type = 2; // "offer" or "answer"
+  string sdp = 3;
 }
 
-message CreateRoomResponse {
-  bool success = 1;
-  string message = 2;
+message IceCandidate {
+  string session_id = 1;
+  string candidate = 2;
+  string sdp_mid = 3;
+  int32 sdp_mline_index = 4;
 }
 
-// ------------------- Присоединение -------------------
-message JoinRoomRequest {
-  string room_id = 1;
-  string user_id = 2;   // идентификатор пользователя (может быть JWT sub и т.д.)
-  string sid = 3;       // session id (опционально, генерируем если пусто)
+message StateUpdate {
+  string participant_id = 1;
+  optional bool muted = 2;
+  optional bool video_on = 3;
+  optional bool screen_sharing = 4;
 }
 
-message JoinRoomResponse {
-  bool success = 1;
-  string sid = 2;               // session id
-  uint32 media_port = 3;        // выбранный UDP-порт для медиа
-  string message = 4;
-}
-
-// ------------------- Signaling -------------------
 message SignalMessage {
-  string sid = 1;
   oneof payload {
-    Description description = 2;
-    Trickle trickle = 3;
+    JoinRequest join = 1;
+    SDP sdp = 2;
+    IceCandidate candidate = 3;
+    StateUpdate state = 4;
   }
 }
 
-message Description {
-  string sdp = 1;
-  string type = 2; // "offer" или "answer"
-}
-
-message Trickle {
-  Candidate candidate = 1;
-}
-
-message Candidate {
-  string candidate = 1;
-  string sdp_mid = 2;
-  int32 sdp_mline_index = 3;
+service SignalingService {
+  rpc SendSignal (stream SignalMessage) returns (stream SignalMessage);
 }
