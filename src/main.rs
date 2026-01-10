@@ -4,15 +4,17 @@ use futures_util::{SinkExt, StreamExt};
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use str0m::change::{SdpAnswer, SdpOffer};
+use str0m::net::DatagramRecv;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
-use str0m::{Candidate, Event, Input, Output, Rtc, RtcError};
-use str0m::media::MediaData;  // Изменено: правильный импорт MediaData
+use str0m::{Candidate, Event, Input, Output, Rtc};
+use str0m::media::MediaData;
 
 const SIGNALING_PORT: u16 = 8080;
 const MEDIA_UDP_PORT: u16 = 5000;
@@ -45,19 +47,15 @@ enum ServerMessage {
     StateUpdate { participant_id: String, muted: bool, video_on: bool, screen_sharing: bool },
 }
 
-type WsSink = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    Message,
->;
-
 struct Peer {
     rtc: Rtc,
-    ws_send: tokio::sync::mpsc::UnboundedSender<Message>, // Изменено: используем канал
+    ws_send: tokio::sync::mpsc::UnboundedSender<Message>,
     participant_id: String,
     name: String,
     muted: bool,
     video_on: bool,
     screen_sharing: bool,
+    remote_addr: Option<SocketAddr>,
 }
 
 struct Room {
@@ -87,7 +85,7 @@ async fn main() -> Result<()> {
             match udp_clone.recv_from(&mut buf).await {
                 Ok((len, src)) => {
                     let now = Instant::now();
-                    let contents = buf[..len].to_vec().into(); // Исправлено: берем срез, а не клонируем весь буфер
+                    let contents = DatagramRecv::from(buf[..len].to_vec());
                     
                     let mut rooms_guard = rooms_udp.lock().await;
                     if let Some((room_id, participant_id)) = find_peer_by_addr(&rooms_guard, src) {
@@ -102,8 +100,18 @@ async fn main() -> Result<()> {
                                 if let Err(e) = peer.rtc.handle_input(input) {
                                     error!("handle_input error: {}", e);
                                 }
-                                // Нужно получить ws_send из peer, но она в Mutex - временно уберем
-                                // drive_rtc(&mut peer.rtc, &mut peer.ws_send, &rooms_guard, room_id, participant_id).await;
+                                
+                                // Обрабатываем вывод RTC после ввода
+                                if let Err(e) = drive_rtc_with_udp(
+                                    &mut peer.rtc, 
+                                    &peer.ws_send, 
+                                    &udp_clone,
+                                    &rooms_guard,
+                                    &room_id,
+                                    &participant_id
+                                ).await {
+                                    error!("drive_rtc error: {}", e);
+                                }
                             }
                         }
                     }
@@ -135,7 +143,6 @@ async fn handle_ws_connection(
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     let (ws_send, mut ws_recv) = ws_stream.split();
 
-    // Создаем канал для отправки сообщений WebSocket
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut ws_sender = ws_send;
     
@@ -164,7 +171,7 @@ async fn handle_ws_connection(
     let local_addr: SocketAddr = udp.local_addr()?;
     let host_cand = Candidate::host(local_addr, "udp")?;
 
-    let mut rtc = Rtc::new();
+    let mut rtc = Rtc::builder().build();
     rtc.add_local_candidate(host_cand);
 
     let mut rooms_guard = rooms.lock().await;
@@ -181,9 +188,10 @@ async fn handle_ws_connection(
         ws_send: tx.clone(),
         participant_id: participant_id.clone(),
         name: name.clone(),
-        muted: true,
+        muted: false,
         video_on: true,
         screen_sharing: false,
+        remote_addr: None,
     };
 
     room.peers.insert(participant_id.clone(), peer);
@@ -213,7 +221,7 @@ async fn handle_ws_connection(
     while let Some(Ok(msg)) = ws_recv.next().await {
         if let Message::Text(text) = msg {
             if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                if let Err(e) = handle_client_message(&rooms, &tx, room_id.clone(), &participant_id, client_msg).await {
+                if let Err(e) = handle_client_message(&rooms, &udp, room_id.clone(), &participant_id, client_msg).await {
                     error!("Error handling client message: {}", e);
                 }
             }
@@ -229,7 +237,7 @@ async fn handle_ws_connection(
 
 async fn handle_client_message(
     rooms: &Rooms,
-    tx: &tokio::sync::mpsc::UnboundedSender<Message>,
+    udp: &Arc<UdpSocket>,
     room_id: String,
     participant_id: &str,
     msg: ClientMessage,
@@ -240,16 +248,27 @@ async fn handle_client_message(
 
     match msg {
         ClientMessage::Offer { sdp } => {
-            let offer = sdp.parse()?;
+            // Парсим SDP оффер
+            let offer = SdpOffer::from_sdp_string(&sdp)?;
+            
+            // Принимаем оффер и получаем answer
             let answer = peer.rtc.sdp_api().accept_offer(offer)?;
-            tx.send(Message::text(json!({
+            
+            // Отправляем ответ клиенту
+            peer.ws_send.send(Message::text(json!({
                 "type": "answer",
-                "sdp": answer.to_string()
+                "sdp": answer.to_sdp_string()
             }).to_string()))?;
         }
         ClientMessage::Candidate { candidate } => {
             let cand = Candidate::from_sdp_string(&candidate)?;
-            peer.rtc.add_remote_candidate(cand);
+            peer.rtc.add_remote_candidate(cand)?;
+            
+            // Сохраняем удалённый адрес для отправки UDP пакетов
+            if let Some(addr) = Some(cand.addr()) {
+                peer.remote_addr = Some(addr);
+                room.addr_to_participant.insert(addr, participant_id.to_string());
+            }
         }
         ClientMessage::StateUpdate { muted, video_on, screen_sharing } => {
             peer.muted = muted;
@@ -274,74 +293,94 @@ async fn handle_client_message(
         _ => {}
     }
 
-    // Drive RTC events
-    drive_rtc(&mut peer.rtc, tx, &rooms_guard, &room_id, participant_id).await;
+    // Обрабатываем события RTC
+    if let Err(e) = drive_rtc_with_udp(
+        &mut peer.rtc, 
+        &peer.ws_send, 
+        udp,
+        &rooms_guard,
+        &room_id,
+        participant_id
+    ).await {
+        error!("drive_rtc error: {}", e);
+    }
 
     Ok(())
 }
 
-async fn drive_rtc(
+async fn drive_rtc_with_udp(
     rtc: &mut Rtc,
     tx: &tokio::sync::mpsc::UnboundedSender<Message>,
-    rooms: &HashMap<String, Room>,
+    udp: &Arc<UdpSocket>,
+    rooms_guard: &HashMap<String, Room>,
     room_id: &str,
     participant_id: &str,
-) {
+) -> Result<()> {
     loop {
-        match rtc.poll_output() {
-            Ok(Output::Timeout(_)) => break,
-            Ok(Output::Transmit(tx_data)) => {
-                // Здесь нужно отправить данные через UDP
-                // Для этого нужен доступ к UDP сокету
-                // Пока пропускаем
+        match rtc.poll_output().unwrap_or(Output::Timeout(Instant::now())) {
+            Output::Timeout(_) => break,
+            Output::Transmit(tx_data) => {
+                // Отправляем UDP пакет
+                if let Err(e) = udp.send_to(&tx_data.contents, tx_data.destination).await {
+                    error!("Failed to send UDP packet: {}", e);
+                }
             }
-            Ok(Output::Event(ev)) => {
+            Output::Event(ev) => {
                 match ev {
-                    Event::IceCandidate(cand) => { // Исправлено: IceCandidate вместо Candidate
+                    Event::IceCandidate(cand) => {
                         let _ = tx.send(Message::text(json!({
                             "type": "candidate",
                             "candidate": cand.to_sdp_string()
                         }).to_string()));
                     }
-                    Event::Media(md) => { // Исправлено: правильный паттерн для MediaData
-                        if let str0m::media::MediaEvent::Data(md) = md {
-                            forward_media_data(rooms, room_id, participant_id, md).await;
+                    Event::MediaData(md) => {
+                        // Форвардим медиа данные другим участникам
+                        if let Err(e) = forward_media_data(rooms_guard, room_id, participant_id, md) {
+                            error!("Failed to forward media: {}", e);
                         }
                     }
                     _ => {}
                 }
             }
-            Err(_) => break,
         }
     }
+    Ok(())
 }
 
-async fn forward_media_data(
-    rooms: &HashMap<String, Room>,
+fn forward_media_data(
+    rooms_guard: &HashMap<String, Room>,
     room_id: &str,
     from_id: &str,
     md: MediaData,
-) {
-    if let Some(room) = rooms.get(room_id) {
+) -> Result<()> {
+    if let Some(room) = rooms_guard.get(room_id) {
         for (to_id, to_peer) in &room.peers {
             if to_id == from_id {
                 continue;
             }
 
+            // Определяем тип медиа по параметрам
+            let is_audio = md.params.spec().codec.is_audio();
+            let is_video = md.params.spec().codec.is_video();
+
             // Проверяем настройки получателя
-            if md.kind == str0m::media::MediaKind::Audio && to_peer.muted {
+            if is_audio && to_peer.muted {
                 continue;
             }
-            if md.kind == str0m::media::MediaKind::Video && !to_peer.video_on {
+            if is_video && !to_peer.video_on {
                 continue;
             }
 
             // Пытаемся получить writer и отправить данные
-            if let Ok(writer) = to_peer.rtc.writer(md.mid).ok_or(err) {
-                let _ = writer.write(md.pt, md.wallclock, md.rtp_time, &md.data);
+            if let Some(mut writer) = to_peer.rtc.writer(md.mid) {
+                let now = Instant::now();
+                if let Err(e) = writer.write(md.pt, now, md.time, md.data.as_ref()) {
+                    error!("Failed to write media data: {}", e);
+                }
             }
         }
     }
+    Ok(())
 }
 
 async fn cleanup_peer(rooms: &Rooms, room_id: String, participant_id: &str) {
@@ -349,9 +388,6 @@ async fn cleanup_peer(rooms: &Rooms, room_id: String, participant_id: &str) {
     if let Some(room) = rooms_guard.get_mut(&room_id) {
         room.peers.remove(participant_id);
         room.addr_to_participant.retain(|_, id| id != participant_id);
-        
-        // Можно отправить сообщение о выходе участника
-        // broadcast_to_room(room, ServerMessage::ParticipantLeft { id: participant_id.to_string() }, None).await;
     }
 }
 

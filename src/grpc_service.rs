@@ -1,4 +1,3 @@
-// grpc_service.rs (без изменений)
 use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 use tokio_stream::wrappers::ReceiverStream;
@@ -84,7 +83,8 @@ impl SfuControl for SfuGrpcService {
 
                 if current_sid.is_none() {
                     current_sid = Some(sid.clone());
-                    let _ = session_manager.set_response_tx(&sid, server_tx..clone()).await;
+                    // ИСПРАВЛЕНО: убрана двойная точка
+                    let _ = session_manager.set_response_tx(&sid, server_tx.clone()).await;
                 }
 
                 if let Some(session) = session_manager.get_session(&sid).await {
