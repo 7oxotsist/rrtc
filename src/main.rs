@@ -17,7 +17,7 @@ use str0m::{Candidate, Event, Input, Output, Rtc};
 use str0m::media::MediaData;
 use futures_util::SinkExt;
 
-const SIGNALING_PORT: u16 = 8080;
+const SIGNALING_PORT: u16 = 8081;
 const MEDIA_UDP_PORT: u16 = 5000;
 
 #[derive(Serialize, Deserialize)]
