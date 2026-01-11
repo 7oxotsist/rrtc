@@ -17,7 +17,7 @@ use str0m::{Candidate, Event, Input, Output, Rtc};
 use str0m::media::MediaData;
 use futures_util::SinkExt;
 
-const SIGNALING_PORT: u16 = 8081;
+const SIGNALING_PORT: u16 = 8080;
 const MEDIA_UDP_PORT: u16 = 5000;
 
 #[derive(Serialize, Deserialize)]
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
                 Ok((len, src)) => {
                     let now = Instant::now();
                     let contents = &buf[..len];
-                    
+
                     let rooms_guard = rooms_udp.lock().await;
                     if let Some((room_id, participant_id)) = find_peer_by_addr(&rooms_guard, src) {
                         // Клонируем Arc<Mutex<Rtc>> и ws_send перед освобождением guard
@@ -100,9 +100,9 @@ async fn main() -> Result<()> {
                         } else {
                             None
                         };
-                        
+
                         drop(rooms_guard); // Освобождаем lock перед обработкой
-                        
+
                         if let Some((rtc_arc, ws_send)) = rtc_clone {
                             if let Ok(datagram) = DatagramRecv::try_from(contents) {
                                 let mut rtc = rtc_arc.lock().await;
@@ -115,11 +115,11 @@ async fn main() -> Result<()> {
                                 if let Err(e) = rtc.handle_input(input) {
                                     error!("handle_input error: {}", e);
                                 }
-                                
+
                                 // Обрабатываем вывод RTC после ввода
                                 if let Err(e) = drive_rtc_with_udp(
-                                    &mut rtc, 
-                                    &ws_send, 
+                                    &mut rtc,
+                                    &ws_send,
                                     &udp_clone,
                                     &rooms_udp,
                                     &room_id,
@@ -160,7 +160,7 @@ async fn handle_ws_connection(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut ws_sender = ws_send;
-    
+
     // Запускаем задачу для отправки сообщений через WebSocket
     let ws_send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -183,8 +183,24 @@ async fn handle_ws_connection(
 
     info!("Participant {} ({}) joined room {}", participant_id, name, room_id);
 
+    // Get the actual host IP address instead of 0.0.0.0
     let local_addr: SocketAddr = udp.local_addr()?;
-    let host_cand = Candidate::host(local_addr, "udp")?;
+
+    // Use a proper IP address for the ICE candidate
+    // In Docker/production, you should get the actual public IP or use STUN
+    let host_ip = if local_addr.ip().is_unspecified() {
+        // If bound to 0.0.0.0, use a default local IP
+        // This should be configured via environment variable in production
+        std::env::var("HOST_IP")
+            .unwrap_or_else(|_| "127.0.0.1".to_string())
+            .parse()
+            .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
+    } else {
+        local_addr.ip()
+    };
+
+    let candidate_addr = SocketAddr::new(host_ip, local_addr.port());
+    let host_cand = Candidate::host(candidate_addr, "udp")?;
 
     let mut rtc = Rtc::builder().build();
     rtc.add_local_candidate(host_cand);
@@ -270,7 +286,7 @@ async fn handle_client_message(
                     }
                 }
             }
-            
+
             // Обновляем состояние текущего пира
             {
                 let mut rooms_guard = rooms.lock().await;
@@ -282,7 +298,7 @@ async fn handle_client_message(
                     }
                 }
             }
-            
+
             // Отправляем уведомления другим участникам
             let msg = ServerMessage::StateUpdate {
                 participant_id: participant_id.to_string(),
@@ -291,35 +307,35 @@ async fn handle_client_message(
                 screen_sharing,
             };
             let text = serde_json::to_string(&msg)?;
-            
+
             for ws_send in ws_sends_to_notify {
                 let _ = ws_send.send(Message::text(text.clone()));
             }
-            
+
             return Ok(());
         }
         ClientMessage::Offer { sdp } => {
             let rooms_guard = rooms.lock().await;
             let room = rooms_guard.get(&room_id).ok_or(anyhow!("no room"))?;
             let peer = room.peers.get(participant_id).ok_or(anyhow!("no peer"))?;
-            
+
             let rtc_arc = peer.rtc.clone();
             let ws_send = peer.ws_send.clone();
             drop(rooms_guard);
-            
+
             let mut rtc = rtc_arc.lock().await;
             let offer = SdpOffer::from_sdp_string(&sdp)?;
             let answer = rtc.sdp_api().accept_offer(offer)?;
-            
+
             ws_send.send(Message::text(json!({
                 "type": "answer",
                 "sdp": answer.to_sdp_string()
             }).to_string()))?;
-            
+
             // Обрабатываем RTC
             if let Err(e) = drive_rtc_with_udp(
-                &mut rtc, 
-                &ws_send, 
+                &mut rtc,
+                &ws_send,
                 udp,
                 rooms,
                 &room_id,
@@ -332,17 +348,17 @@ async fn handle_client_message(
             let rooms_guard = rooms.lock().await;
             let room = rooms_guard.get(&room_id).ok_or(anyhow!("no room"))?;
             let peer = room.peers.get(participant_id).ok_or(anyhow!("no peer"))?;
-            
+
             let rtc_arc = peer.rtc.clone();
             let ws_send = peer.ws_send.clone();
             drop(rooms_guard);
-            
+
             let mut rtc = rtc_arc.lock().await;
             let cand = Candidate::from_sdp_string(&candidate)?;
             rtc.add_remote_candidate(cand.clone());
-            
+
             let addr = cand.addr();
-            
+
             // Обновляем remote_addr и addr_to_participant
             {
                 let mut rooms_guard = rooms.lock().await;
@@ -353,11 +369,11 @@ async fn handle_client_message(
                     }
                 }
             }
-            
+
             // Обрабатываем RTC
             if let Err(e) = drive_rtc_with_udp(
-                &mut rtc, 
-                &ws_send, 
+                &mut rtc,
+                &ws_send,
                 udp,
                 rooms,
                 &room_id,
@@ -368,7 +384,7 @@ async fn handle_client_message(
         }
         _ => {}
     }
-    
+
     Ok(())
 }
 
@@ -418,7 +434,7 @@ async fn forward_media_data(
     let receivers: Vec<(String, bool, bool, Arc<tokio::sync::Mutex<Rtc>>)> = {
         let rooms_guard = rooms.lock().await;
         let room = rooms_guard.get(room_id).ok_or(anyhow!("no room"))?;
-        
+
         room.peers.iter()
             .filter(|(id, _)| *id != from_id)
             .map(|(to_id, to_peer)| {
@@ -431,11 +447,11 @@ async fn forward_media_data(
             })
             .collect()
     };
-    
+
     // Определяем тип медиа
     let is_audio = md.params.spec().codec.is_audio();
     let is_video = md.params.spec().codec.is_video();
-    
+
     // Обрабатываем каждого получателя
     for (to_id, muted, video_on, rtc_arc) in receivers {
         // Проверяем настройки получателя
@@ -445,10 +461,10 @@ async fn forward_media_data(
         if is_video && !video_on {
             continue;
         }
-        
+
         // Получаем доступ к Rtc
         let mut rtc = rtc_arc.lock().await;
-        
+
         // Пытаемся получить writer и отправить данные
         if let Some(writer) = rtc.writer(md.mid) {
             let now = Instant::now();
@@ -457,7 +473,7 @@ async fn forward_media_data(
             }
         }
     }
-    
+
     Ok(())
 }
 
