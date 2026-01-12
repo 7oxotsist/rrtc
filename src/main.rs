@@ -1,495 +1,375 @@
-// src/main.rs
-use anyhow::{anyhow, Result};
-use futures_util::StreamExt;
-use log::{error, info};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use str0m::change::SdpOffer;
-use str0m::net::DatagramRecv;
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use anyhow::Result;
+use futures_util::{SinkExt, StreamExt};
+use log::{error, info, warn};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
 use tokio_tungstenite::tungstenite::Message;
-use str0m::{Candidate, Event, Input, Output, Rtc};
-use str0m::media::MediaData;
-use futures_util::SinkExt;
 
-const SIGNALING_PORT: u16 = 8080;
-const MEDIA_UDP_PORT: u16 = 5000;
+mod config;
+mod messages;
+mod peer;
+mod room;
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum ClientMessage {
-    #[serde(rename = "join")]
-    Join { room: String, participant: String, name: String },
-    #[serde(rename = "offer")]
-    Offer { sdp: String },
-    #[serde(rename = "candidate")]
-    Candidate { candidate: String },
-    #[serde(rename = "state_update")]
-    StateUpdate { muted: bool, video_on: bool, screen_sharing: bool },
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type")]
-enum ServerMessage {
-    #[serde(rename = "joined")]
-    Joined { your_id: String },
-    #[serde(rename = "answer")]
-    Answer { sdp: String },
-    #[serde(rename = "candidate")]
-    Candidate { candidate: String },
-    #[serde(rename = "participant_joined")]
-    ParticipantJoined { id: String, name: String },
-    #[serde(rename = "state_update")]
-    StateUpdate { participant_id: String, muted: bool, video_on: bool, screen_sharing: bool },
-}
-
-struct Peer {
-    rtc: Arc<tokio::sync::Mutex<Rtc>>,
-    ws_send: tokio::sync::mpsc::UnboundedSender<Message>,
-    participant_id: String,
-    name: String,
-    muted: bool,
-    video_on: bool,
-    screen_sharing: bool,
-    remote_addr: Option<SocketAddr>,
-}
-
-struct Room {
-    peers: HashMap<String, Peer>,
-    addr_to_participant: HashMap<SocketAddr, String>,
-}
-
-type Rooms = Arc<Mutex<HashMap<String, Room>>>;
+use config::ServerConfig;
+use messages::{ClientMessage, ParticipantInfo, ServerMessage};
+use peer::{Peer, PeerBuilder};
+use room::RoomManager;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    // Инициализация логирования
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
+    info!("Starting Rust WebRTC SFU Server");
 
-    let udp = Arc::new(UdpSocket::bind(format!("0.0.0.0:{}", MEDIA_UDP_PORT)).await?);
-    info!("Media UDP listening on :{}", MEDIA_UDP_PORT);
+    // Загрузка конфигурации
+    let config = ServerConfig::load()?;
+    config.validate()?;
 
-    let signaling_listener = TcpListener::bind(format!("0.0.0.0:{}", SIGNALING_PORT)).await?;
-    info!("Signaling WS server listening on :{}", SIGNALING_PORT);
+    info!("Configuration loaded:");
+    info!("  Listen address: {}", config.listen_address);
+    info!("  Signaling port: {}", config.signaling_port);
+    info!("  ICE servers: {}", config.ice_servers.len());
+    info!("  Max participants per room: {}", config.max_participants_per_room);
 
-    let udp_clone = udp.clone();
-    let rooms_udp = rooms.clone();
+    let config = Arc::new(config);
+
+    // Создание менеджера комнат
+    let room_manager = Arc::new(RoomManager::new());
+
+    // Запуск фоновой задачи для очистки пустых комнат
+    let rm_cleanup = room_manager.clone();
+    let cleanup_interval = config.cleanup_interval_secs;
     tokio::spawn(async move {
-        let mut buf = vec![0u8; 2000];
+        let mut interval = interval(Duration::from_secs(cleanup_interval));
         loop {
-            match udp_clone.recv_from(&mut buf).await {
-                Ok((len, src)) => {
-                    let now = Instant::now();
-                    let contents = &buf[..len];
-
-                    let rooms_guard = rooms_udp.lock().await;
-                    if let Some((room_id, participant_id)) = find_peer_by_addr(&rooms_guard, src) {
-                        // Клонируем Arc<Mutex<Rtc>> и ws_send перед освобождением guard
-                        let rtc_clone = if let Some(room) = rooms_guard.get(&room_id) {
-                            if let Some(peer) = room.peers.get(&participant_id) {
-                                Some((peer.rtc.clone(), peer.ws_send.clone()))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-
-                        drop(rooms_guard); // Освобождаем lock перед обработкой
-
-                        if let Some((rtc_arc, ws_send)) = rtc_clone {
-                            if let Ok(datagram) = DatagramRecv::try_from(contents) {
-                                let mut rtc = rtc_arc.lock().await;
-                                let input = Input::Receive(now, str0m::net::Receive {
-                                    source: src,
-                                    destination: udp_clone.local_addr().unwrap(),
-                                    contents: datagram,
-                                    proto: str0m::net::Protocol::Udp,
-                                });
-                                if let Err(e) = rtc.handle_input(input) {
-                                    error!("handle_input error: {}", e);
-                                }
-
-                                // Обрабатываем вывод RTC после ввода
-                                if let Err(e) = drive_rtc_with_udp(
-                                    &mut rtc,
-                                    &ws_send,
-                                    &udp_clone,
-                                    &rooms_udp,
-                                    &room_id,
-                                    &participant_id
-                                ).await {
-                                    error!("drive_rtc error: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => error!("UDP recv error: {}", e),
-            }
+            interval.tick().await;
+            rm_cleanup.cleanup_all_empty_rooms().await;
         }
     });
 
+    // Запуск WebSocket сервера
+    let addr = format!("{}:{}", config.listen_address, config.signaling_port);
+    let listener = TcpListener::bind(&addr).await?;
+
+    info!("WebRTC SFU listening on {}", addr);
+    info!("Server is ready to accept connections");
+
     loop {
-        let (stream, addr) = signaling_listener.accept().await?;
-        info!("New WS connection from {}", addr);
-        let rooms_clone = rooms.clone();
-        let udp_clone = udp.clone();
+        let (stream, peer_addr) = listener.accept().await?;
+        info!("New connection from {}", peer_addr);
+
+        let room_manager = room_manager.clone();
+        let config = config.clone();
+
         tokio::spawn(async move {
-            if let Err(e) = handle_ws_connection(stream, rooms_clone, udp_clone, addr).await {
-                error!("WS handler error: {}", e);
+            if let Err(e) = handle_connection(stream, room_manager, config).await {
+                error!("Connection error from {}: {}", peer_addr, e);
             }
         });
     }
 }
 
-async fn handle_ws_connection(
+async fn handle_connection(
     stream: tokio::net::TcpStream,
-    rooms: Rooms,
-    udp: Arc<UdpSocket>,
-    client_addr: SocketAddr,
+    room_manager: Arc<RoomManager>,
+    config: Arc<ServerConfig>,
 ) -> Result<()> {
+    // Принимаем WebSocket соединение
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
-    let (ws_send, mut ws_recv) = ws_stream.split();
+    let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut ws_sender = ws_send;
+    // Создаем канал для отправки сообщений клиенту
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
-    // Запускаем задачу для отправки сообщений через WebSocket
-    let ws_send_task = tokio::spawn(async move {
+    // Задача для отправки сообщений в WebSocket
+    let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if let Err(e) = ws_sender.send(msg).await {
-                error!("Failed to send WS message: {}", e);
+            if let Err(e) = ws_sink.send(msg).await {
+                error!("Failed to send WebSocket message: {}", e);
                 break;
             }
         }
     });
 
-    // Первый message — join
-    let msg = ws_recv.next().await.ok_or(anyhow!("no join message"))??;
-    let text = if let Message::Text(t) = msg { t } else { return Ok(()) };
-
-    let join: ClientMessage = serde_json::from_str(&text)?;
-    let (room_id, participant_id, name) = match join {
-        ClientMessage::Join { room, participant, name } => (room, participant, name),
-        _ => return Ok(()),
+    // Ожидаем сообщение Join
+    let msg = match ws_stream.next().await {
+        Some(Ok(Message::Text(text))) => text,
+        Some(Ok(Message::Close(_))) => {
+            info!("Client closed connection before joining");
+            send_task.abort();
+            return Ok(());
+        }
+        _ => {
+            warn!("Invalid first message from client");
+            send_task.abort();
+            return Ok(());
+        }
     };
 
-    info!("Participant {} ({}) joined room {}", participant_id, name, room_id);
-
-    // Get the actual host IP address instead of 0.0.0.0
-    let local_addr: SocketAddr = udp.local_addr()?;
-
-    // Use a proper IP address for the ICE candidate
-    // In Docker/production, you should get the actual public IP or use STUN
-    let host_ip = if local_addr.ip().is_unspecified() {
-        // If bound to 0.0.0.0, use a default local IP
-        // This should be configured via environment variable in production
-        std::env::var("HOST_IP")
-            .unwrap_or_else(|_| "127.0.0.1".to_string())
-            .parse()
-            .unwrap_or_else(|_| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
-    } else {
-        local_addr.ip()
+    let join_msg: ClientMessage = match serde_json::from_str(&msg) {
+        Ok(msg) => msg,
+        Err(e) => {
+            error!("Failed to parse join message: {}", e);
+            send_task.abort();
+            return Ok(());
+        }
     };
 
-    let candidate_addr = SocketAddr::new(host_ip, local_addr.port());
-    let host_cand = Candidate::host(candidate_addr, "udp")?;
-
-    let mut rtc = Rtc::builder().build();
-    rtc.add_local_candidate(host_cand);
-
-    let mut rooms_guard = rooms.lock().await;
-    let room = rooms_guard.entry(room_id.clone()).or_insert_with(|| Room {
-        peers: HashMap::new(),
-        addr_to_participant: HashMap::new(),
-    });
-
-    // Запоминаем адрес клиента
-    room.addr_to_participant.insert(client_addr, participant_id.clone());
-
-    let peer = Peer {
-        rtc: Arc::new(tokio::sync::Mutex::new(rtc)),
-        ws_send: tx.clone(),
-        participant_id: participant_id.clone(),
-        name: name.clone(),
-        muted: false,
-        video_on: true,
-        screen_sharing: false,
-        remote_addr: None,
+    let (room_id, participant_id, name) = match join_msg {
+        ClientMessage::Join {
+            room,
+            participant,
+            name,
+        } => (room, participant, name),
+        _ => {
+            error!("Expected join message");
+            send_task.abort();
+            return Ok(());
+        }
     };
 
-    room.peers.insert(participant_id.clone(), peer);
+    info!(
+        "Participant {} ({}) joining room {}",
+        participant_id, name, room_id
+    );
 
-    // Отправляем Joined сообщение
-    tx.send(Message::text(
-        serde_json::to_string(&ServerMessage::Joined {
-            your_id: participant_id.clone(),
-        })?
-    ))?;
+    // Получаем или создаем комнату
+    let room = room_manager.get_or_create_room(room_id.clone()).await;
 
-    // Отправляем broadcast о новом участнике другим клиентам
-    for (id, other_peer) in &room.peers {
-        if id != &participant_id {
-            let _ = other_peer.ws_send.send(Message::text(
-                serde_json::to_string(&ServerMessage::ParticipantJoined {
-                    id: participant_id.clone(),
-                    name: name.clone(),
-                })?
+    // Проверяем лимит участников
+    if room.peer_count().await >= config.max_participants_per_room {
+        error!("Room {} is full", room_id);
+        let _ = tx.send(Message::text(
+            serde_json::to_string(&ServerMessage::Error {
+                message: "Room is full".to_string(),
+                code: Some(403),
+            })
+            .unwrap_or_default(),
+        ));
+        send_task.abort();
+        return Ok(());
+    }
+
+    // Создаем Peer с ICE серверами из конфигурации
+    let ice_servers = config.get_rtc_ice_servers();
+    let peer = match PeerBuilder::new(participant_id.clone(), name.clone(), tx.clone())
+        .with_ice_servers(ice_servers)
+        .build()
+        .await
+    {
+        Ok(peer) => Arc::new(peer),
+        Err(e) => {
+            error!("Failed to create peer: {}", e);
+            send_task.abort();
+            return Err(e);
+        }
+    };
+
+    // Настраиваем обработчик входящих треков
+    let room_clone = room.clone();
+    let peer_id_clone = participant_id.clone();
+
+    peer.pc
+        .on_track(Box::new(move |track, _receiver, _transceiver| {
+            let room = room_clone.clone();
+            let from_id = peer_id_clone.clone();
+            let track = track.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = room.handle_incoming_track(from_id, track).await {
+                    error!("Error handling track: {}", e);
+                }
+            });
+
+            Box::pin(async {})
+        }));
+
+    // Получаем список существующих участников
+    let existing_peers = room.get_all_peers().await;
+    let mut participants_info = Vec::new();
+
+    for existing_peer in &existing_peers {
+        if existing_peer.id != participant_id {
+            let (muted, video_on, screen_sharing) = existing_peer.get_state().await;
+            participants_info.push(ParticipantInfo::with_state(
+                existing_peer.id.clone(),
+                existing_peer.name.clone(),
+                muted,
+                video_on,
+                screen_sharing,
             ));
         }
     }
 
-    drop(rooms_guard);
+    // Добавляем участника в комнату
+    room.add_peer(peer.clone()).await?;
 
-    // Основной цикл обработки WS сообщений
-    while let Some(Ok(msg)) = ws_recv.next().await {
-        if let Message::Text(text) = msg {
-            if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                if let Err(e) = handle_client_message(&rooms, &udp, room_id.clone(), &participant_id, client_msg).await {
-                    error!("Error handling client message: {}", e);
+    // Отправляем подтверждение присоединения
+    peer.send_message(ServerMessage::Joined {
+        your_id: participant_id.clone(),
+        participants: participants_info,
+    })?;
+
+    info!(
+        "Peer {} successfully joined room {} ({} participants)",
+        participant_id,
+        room_id,
+        room.peer_count().await
+    );
+
+    // Обрабатываем входящие сообщения от клиента
+    let peer_for_loop = peer.clone();
+    let room_for_loop = room.clone();
+
+    while let Some(msg_result) = ws_stream.next().await {
+        match msg_result {
+            Ok(Message::Text(text)) => {
+                match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(client_msg) => {
+                        if let Err(e) =
+                            handle_client_message(client_msg, peer_for_loop.clone(), room_for_loop.clone())
+                                .await
+                        {
+                            error!("Error handling message: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse client message: {}", e);
+                    }
                 }
             }
+            Ok(Message::Close(_)) => {
+                info!("Client {} closed connection", participant_id);
+                break;
+            }
+            Ok(Message::Ping(data)) => {
+                let _ = peer_for_loop.ws_tx.send(Message::Pong(data));
+            }
+            Ok(Message::Pong(_)) => {
+                // Pong received
+            }
+            Err(e) => {
+                error!("WebSocket error for {}: {}", participant_id, e);
+                break;
+            }
+            _ => {}
         }
     }
 
-    // Cleanup
-    cleanup_peer(&rooms, room_id, &participant_id).await;
-    ws_send_task.abort();
+    // Очистка при отключении
+    info!("Peer {} disconnecting from room {}", participant_id, room_id);
+    room.remove_peer(&participant_id).await?;
+
+    // Очищаем комнату если она пуста
+    room_manager.cleanup_empty_room(&room_id).await;
+
+    send_task.abort();
 
     Ok(())
 }
 
 async fn handle_client_message(
-    rooms: &Rooms,
-    udp: &Arc<UdpSocket>,
-    room_id: String,
-    participant_id: &str,
     msg: ClientMessage,
+    peer: Arc<Peer>,
+    room: Arc<room::Room>,
 ) -> Result<()> {
     match msg {
-        ClientMessage::StateUpdate { muted, video_on, screen_sharing } => {
-            // Собираем WS сендеры для уведомлений до изменяемого доступа
-            let mut ws_sends_to_notify = Vec::new();
-            {
-                let rooms_guard = rooms.lock().await;
-                let room = rooms_guard.get(&room_id).ok_or(anyhow!("no room"))?;
-                for (id, other_peer) in &room.peers {
-                    if id != participant_id {
-                        ws_sends_to_notify.push(other_peer.ws_send.clone());
-                    }
-                }
-            }
-
-            // Обновляем состояние текущего пира
-            {
-                let mut rooms_guard = rooms.lock().await;
-                if let Some(room) = rooms_guard.get_mut(&room_id) {
-                    if let Some(peer) = room.peers.get_mut(participant_id) {
-                        peer.muted = muted;
-                        peer.video_on = video_on;
-                        peer.screen_sharing = screen_sharing;
-                    }
-                }
-            }
-
-            // Отправляем уведомления другим участникам
-            let msg = ServerMessage::StateUpdate {
-                participant_id: participant_id.to_string(),
-                muted,
-                video_on,
-                screen_sharing,
-            };
-            let text = serde_json::to_string(&msg)?;
-
-            for ws_send in ws_sends_to_notify {
-                let _ = ws_send.send(Message::text(text.clone()));
-            }
-
-            return Ok(());
-        }
         ClientMessage::Offer { sdp } => {
-            let rooms_guard = rooms.lock().await;
-            let room = rooms_guard.get(&room_id).ok_or(anyhow!("no room"))?;
-            let peer = room.peers.get(participant_id).ok_or(anyhow!("no peer"))?;
-
-            let rtc_arc = peer.rtc.clone();
-            let ws_send = peer.ws_send.clone();
-            drop(rooms_guard);
-
-            let mut rtc = rtc_arc.lock().await;
-            let offer = SdpOffer::from_sdp_string(&sdp)?;
-            let answer = rtc.sdp_api().accept_offer(offer)?;
-
-            ws_send.send(Message::text(json!({
-                "type": "answer",
-                "sdp": answer.to_sdp_string()
-            }).to_string()))?;
-
-            // Обрабатываем RTC
-            if let Err(e) = drive_rtc_with_udp(
-                &mut rtc,
-                &ws_send,
-                udp,
-                rooms,
-                &room_id,
-                participant_id
-            ).await {
-                error!("drive_rtc error: {}", e);
-            }
+            info!("Received offer from peer {}", peer.id);
+            let answer_sdp = peer.handle_offer(sdp).await?;
+            peer.send_message(ServerMessage::Answer { sdp: answer_sdp })?;
         }
+
+        ClientMessage::Answer { sdp } => {
+            info!("Received answer from peer {} (unexpected)", peer.id);
+            // В SFU модели клиент обычно не отправляет answer, но обрабатываем на всякий случай
+            let answer = webrtc::peer_connection::sdp::session_description::RTCSessionDescription::answer(sdp)?;
+            peer.pc.set_remote_description(answer).await?;
+        }
+
         ClientMessage::Candidate { candidate } => {
-            let rooms_guard = rooms.lock().await;
-            let room = rooms_guard.get(&room_id).ok_or(anyhow!("no room"))?;
-            let peer = room.peers.get(participant_id).ok_or(anyhow!("no peer"))?;
+            peer.add_ice_candidate(candidate).await?;
+        }
 
-            let rtc_arc = peer.rtc.clone();
-            let ws_send = peer.ws_send.clone();
-            drop(rooms_guard);
+        ClientMessage::StateUpdate {
+            muted,
+            video_on,
+            screen_sharing,
+        } => {
+            peer.update_state(muted, video_on, screen_sharing).await;
 
-            let mut rtc = rtc_arc.lock().await;
-            let cand = Candidate::from_sdp_string(&candidate)?;
-            rtc.add_remote_candidate(cand.clone());
+            // Транслируем обновление состояния другим участникам
+            room.broadcast_message(
+                &peer.id,
+                ServerMessage::StateUpdate {
+                    participant_id: peer.id.clone(),
+                    muted,
+                    video_on,
+                    screen_sharing,
+                },
+            )
+            .await;
+        }
 
-            let addr = cand.addr();
+        ClientMessage::StartScreenShare => {
+            info!("Peer {} started screen sharing", peer.id);
+            peer.update_state(*peer.muted.read().await, *peer.video_on.read().await, true)
+                .await;
 
-            // Обновляем remote_addr и addr_to_participant
-            {
-                let mut rooms_guard = rooms.lock().await;
-                if let Some(room) = rooms_guard.get_mut(&room_id) {
-                    if let Some(peer) = room.peers.get_mut(participant_id) {
-                        peer.remote_addr = Some(addr);
-                        room.addr_to_participant.insert(addr, participant_id.to_string());
-                    }
+            room.broadcast_message(
+                &peer.id,
+                ServerMessage::ScreenShareStarted {
+                    participant_id: peer.id.clone(),
+                },
+            )
+            .await;
+        }
+
+        ClientMessage::StopScreenShare => {
+            info!("Peer {} stopped screen sharing", peer.id);
+            peer.update_state(*peer.muted.read().await, *peer.video_on.read().await, false)
+                .await;
+
+            room.broadcast_message(
+                &peer.id,
+                ServerMessage::ScreenShareStopped {
+                    participant_id: peer.id.clone(),
+                },
+            )
+            .await;
+        }
+
+        ClientMessage::Ping => {
+            peer.send_message(ServerMessage::Pong)?;
+        }
+
+        ClientMessage::GetParticipants => {
+            let peers = room.get_all_peers().await;
+            let mut participants = Vec::new();
+
+            for p in peers {
+                if p.id != peer.id {
+                    let (muted, video_on, screen_sharing) = p.get_state().await;
+                    participants.push(ParticipantInfo::with_state(
+                        p.id.clone(),
+                        p.name.clone(),
+                        muted,
+                        video_on,
+                        screen_sharing,
+                    ));
                 }
             }
 
-            // Обрабатываем RTC
-            if let Err(e) = drive_rtc_with_udp(
-                &mut rtc,
-                &ws_send,
-                udp,
-                rooms,
-                &room_id,
-                participant_id
-            ).await {
-                error!("drive_rtc error: {}", e);
-            }
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-
-async fn drive_rtc_with_udp(
-    rtc: &mut Rtc,
-    _tx: &tokio::sync::mpsc::UnboundedSender<Message>,
-    udp: &Arc<UdpSocket>,
-    rooms: &Rooms,
-    room_id: &str,
-    participant_id: &str,
-) -> Result<()> {
-    loop {
-        match rtc.poll_output().unwrap_or(Output::Timeout(Instant::now())) {
-            Output::Timeout(_) => break,
-            Output::Transmit(tx_data) => {
-                // Отправляем UDP пакет
-                if let Err(e) = udp.send_to(&tx_data.contents, tx_data.destination).await {
-                    error!("Failed to send UDP packet: {}", e);
-                }
-            }
-            Output::Event(ev) => {
-                match ev {
-                    Event::IceConnectionStateChange(state) => {
-                        info!("ICE connection state changed: {:?}", state);
-                    }
-                    Event::MediaData(md) => {
-                        // Форвардим медиа данные другим участникам
-                        if let Err(e) = forward_media_data(rooms, room_id, participant_id, md).await {
-                            error!("Failed to forward media: {}", e);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn forward_media_data(
-    rooms: &Rooms,
-    room_id: &str,
-    from_id: &str,
-    md: MediaData,
-) -> Result<()> {
-    // Собираем информацию о получателях
-    let receivers: Vec<(String, bool, bool, Arc<tokio::sync::Mutex<Rtc>>)> = {
-        let rooms_guard = rooms.lock().await;
-        let room = rooms_guard.get(room_id).ok_or(anyhow!("no room"))?;
-
-        room.peers.iter()
-            .filter(|(id, _)| *id != from_id)
-            .map(|(to_id, to_peer)| {
-                (
-                    to_id.clone(),
-                    to_peer.muted,
-                    to_peer.video_on,
-                    to_peer.rtc.clone(),
-                )
-            })
-            .collect()
-    };
-
-    // Определяем тип медиа
-    let is_audio = md.params.spec().codec.is_audio();
-    let is_video = md.params.spec().codec.is_video();
-
-    // Обрабатываем каждого получателя
-    for (to_id, muted, video_on, rtc_arc) in receivers {
-        // Проверяем настройки получателя
-        if is_audio && muted {
-            continue;
-        }
-        if is_video && !video_on {
-            continue;
+            peer.send_message(ServerMessage::Participants { participants })?;
         }
 
-        // Получаем доступ к Rtc
-        let mut rtc = rtc_arc.lock().await;
-
-        // Пытаемся получить writer и отправить данные
-        if let Some(writer) = rtc.writer(md.mid) {
-            let now = Instant::now();
-            if let Err(e) = writer.write(md.pt, now, md.time, md.data.as_slice()) {
-                error!("Failed to write media data to {}: {}", to_id, e);
-            }
+        ClientMessage::Join { .. } => {
+            warn!("Received duplicate join message from peer {}", peer.id);
         }
     }
 
     Ok(())
-}
-
-async fn cleanup_peer(rooms: &Rooms, room_id: String, participant_id: &str) {
-    let mut rooms_guard = rooms.lock().await;
-    if let Some(room) = rooms_guard.get_mut(&room_id) {
-        room.peers.remove(participant_id);
-        room.addr_to_participant.retain(|_, id| id != participant_id);
-    }
-}
-
-fn find_peer_by_addr(rooms: &HashMap<String, Room>, src: SocketAddr) -> Option<(String, String)> {
-    for (room_id, room) in rooms {
-        if let Some(participant_id) = room.addr_to_participant.get(&src) {
-            return Some((room_id.clone(), participant_id.clone()));
-        }
-    }
-    None
 }
