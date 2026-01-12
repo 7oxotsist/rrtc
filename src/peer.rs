@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
@@ -15,6 +15,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
 use webrtc::rtp_transceiver::rtp_sender::RTCRtpSender;
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
 use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
 use webrtc::track::track_local::TrackLocal;
 use interceptor::registry::Registry;
@@ -34,6 +35,17 @@ impl TrackType {
         if track_id.contains("screen") {
             TrackType::Screen
         } else if track_id.contains("audio") {
+            TrackType::Audio
+        } else {
+            TrackType::Camera
+        }
+    }
+
+    /// Определяет тип трека по RTPCodecType (Audio/Video) и ID
+    pub fn from_track(track_id: &str, codec_type: RTPCodecType) -> Self {
+        if track_id.contains("screen") {
+            TrackType::Screen
+        } else if codec_type == RTPCodecType::Audio {
             TrackType::Audio
         } else {
             TrackType::Camera
@@ -230,15 +242,31 @@ impl Peer {
     }
 
     /// Обрабатывает offer от клиента и создает answer
+    /// Также создает исходящие треки для пересылки медиа от других участников
     pub async fn handle_offer(&self, sdp: String) -> Result<String> {
         let offer = RTCSessionDescription::offer(sdp)?;
         self.pc.set_remote_description(offer).await?;
+
+        // Создаем исходящие треки для получения медиа от других участников
+        // Один аудио трек и один видео трек для камеры
+        self.add_local_track("audio/opus", &format!("audio-{}", self.id), TrackType::Audio).await?;
+        self.add_local_track("video/VP8", &format!("video-{}", self.id), TrackType::Camera).await?;
+
+        info!("Created outgoing tracks for peer {} to receive media from others", self.id);
+
+        // Получаем все transceivers и устанавливаем направление sendrecv
+        // чтобы SFU мог отправлять медиа обратно клиенту
+        let transceivers = self.pc.get_transceivers().await;
+        for transceiver in transceivers {
+            // Устанавливаем direction в sendrecv для отправки медиа
+            transceiver.set_direction(RTCRtpTransceiverDirection::Sendrecv).await;
+        }
 
         let answer = self.pc.create_answer(None).await?;
         let answer_sdp = answer.sdp.clone();
         self.pc.set_local_description(answer).await?;
 
-        info!("Created answer for peer {}", self.id);
+        info!("Created answer for peer {} with sendrecv transceivers", self.id);
         Ok(answer_sdp)
     }
 

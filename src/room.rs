@@ -127,7 +127,7 @@ impl Room {
         from_peer_id: String,
         track: Arc<TrackRemote>,
     ) -> Result<()> {
-        let track_type = TrackType::from_track_id(&track.id());
+        let track_type = TrackType::from_track(&track.id(), track.kind());
 
         info!(
             "Room {}: Handling incoming {:?} track from peer {} (id: {}, kind: {:?})",
@@ -178,6 +178,12 @@ async fn relay_track(
 ) -> Result<()> {
     let mut buf = vec![0u8; 1500];
     let mut packet_count = 0u64;
+    let mut forwarded_count = 0u64;
+
+    info!(
+        "Starting relay for {:?} track from peer {} in room {} (track_id: {}, kind: {:?})",
+        track_type, from_id, room_id, track.id(), track.kind()
+    );
 
     loop {
         // Читаем RTP пакет из входящего трека
@@ -196,16 +202,17 @@ async fn relay_track(
 
         packet_count += 1;
 
-        // Каждые 1000 пакетов логируем для отладки
-        if packet_count % 1000 == 0 {
-            debug!(
-                "Relayed {} packets for track {:?} from peer {} in room {}",
-                packet_count, track_type, from_id, room_id
+        // Логируем первый пакет и каждые 500 пакетов для отладки
+        if packet_count == 1 || packet_count % 500 == 0 {
+            info!(
+                "Relay {:?}: received {} packets, forwarded {} from peer {} in room {}",
+                track_type, packet_count, forwarded_count, from_id, room_id
             );
         }
 
         // Получаем список участников для пересылки
         let peers_guard = peers.read().await;
+        let peer_count = peers_guard.len();
 
         for (peer_id, peer) in peers_guard.iter() {
             // Не отправляем трек обратно отправителю
@@ -213,58 +220,85 @@ async fn relay_track(
                 continue;
             }
 
-            // Проверяем состояние участника
-            let (muted, video_on, screen_sharing) = peer.get_state().await;
+            // Ищем соответствующий локальный трек для отправки
+            let local_tracks = peer.local_tracks.read().await;
+            let local_tracks_count = local_tracks.len();
 
-            // Фильтруем треки на основе состояния
-            match track_type {
-                TrackType::Audio => {
-                    if muted {
-                        continue;
-                    }
-                }
-                TrackType::Camera => {
-                    if !video_on {
-                        continue;
-                    }
-                }
-                TrackType::Screen => {
-                    // Экран всегда пересылается если screen_sharing активен
-                    if !screen_sharing {
-                        continue;
-                    }
+            // Логируем при первом пакете
+            if packet_count == 1 {
+                info!(
+                    "Peer {} has {} local tracks, looking for {:?} kind {:?}",
+                    peer_id, local_tracks_count, track_type, track.kind()
+                );
+                for lt in local_tracks.iter() {
+                    info!(
+                        "  - Track type: {:?}, kind: {:?}, id: {}",
+                        lt.track_type, lt.track.kind(), lt.track.id()
+                    );
                 }
             }
 
-            // Ищем соответствующий локальный трек для отправки
-            let local_tracks = peer.local_tracks.read().await;
-
+            let mut found_track = false;
             for local_track_info in local_tracks.iter() {
                 // Проверяем, совпадает ли тип трека и codec type
                 if local_track_info.track_type == track_type
                     && local_track_info.track.kind() == track.kind()
                 {
+                    found_track = true;
                     // Отправляем RTP пакет
-                    if let Err(e) = local_track_info.track.write_rtp(&rtp_packet).await {
-                        if e.to_string().contains("InvalidState") {
-                            // Соединение закрыто, это нормально
-                            debug!("Track closed for peer {}", peer_id);
-                        } else {
-                            warn!(
-                                "Error writing RTP to peer {} track {:?}: {}",
-                                peer_id, track_type, e
-                            );
+                    match local_track_info.track.write_rtp(&rtp_packet).await {
+                        Ok(_) => {
+                            forwarded_count += 1;
+                            if packet_count % 100 == 0 {
+                                debug!(
+                                    "Successfully wrote packet {} to peer {} track {:?}",
+                                    packet_count, peer_id, track_type
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            let error_str = e.to_string();
+                            if error_str.contains("InvalidState") {
+                                // Соединение закрыто, это нормально
+                                debug!("Track closed for peer {}", peer_id);
+                            } else {
+                                // Логируем все остальные ошибки подробно
+                                error!(
+                                    "Error writing RTP packet {} to peer {} track {:?} (kind {:?}): {}",
+                                    packet_count, peer_id, track_type, track.kind(), error_str
+                                );
+                                // Логируем каждую 10-ю ошибку чтобы не спамить
+                                if packet_count % 10 == 0 {
+                                    error!("RTP write error details: peer_id={}, track_type={:?}, track_id={}, error={}",
+                                        peer_id, track_type, local_track_info.track.id(), error_str);
+                                }
+                            }
                         }
                     }
                     break;
                 }
             }
+
+            if !found_track && packet_count == 1 {
+                warn!(
+                    "No matching local track found for peer {} to receive {:?} from {}",
+                    peer_id, track_type, from_id
+                );
+            }
+        }
+
+        // Предупреждаем если нет получателей
+        if packet_count == 1 && peer_count <= 1 {
+            info!(
+                "Only {} peer(s) in room, no one to forward {:?} to",
+                peer_count, track_type
+            );
         }
     }
 
     info!(
-        "Track relay stopped for {:?} from peer {} in room {} (total packets: {})",
-        track_type, from_id, room_id, packet_count
+        "Track relay stopped for {:?} from peer {} in room {} (received: {}, forwarded: {})",
+        track_type, from_id, room_id, packet_count, forwarded_count
     );
 
     Ok(())

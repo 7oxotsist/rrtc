@@ -99,6 +99,15 @@ fn default_ice_servers() -> Vec<IceServerConfig> {
             username: None,
             credential: None,
         },
+        // Coturn TURN server для NAT traversal
+        IceServerConfig {
+            urls: vec![
+                "turn:coturn:3478?transport=udp".to_string(),
+                "turn:coturn:3478?transport=tcp".to_string(),
+            ],
+            username: Some("webrtc".to_string()),
+            credential: Some("secure_password_123".to_string()),
+        },
     ]
 }
 
